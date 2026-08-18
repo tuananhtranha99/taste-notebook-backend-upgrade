@@ -1,0 +1,34 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  datasource:
+    # Supabase: Project Settings -> Database -> Connection string (URI / JDBC).
+    # Example: jdbc:postgresql://db.xxxxxxxx.supabase.co:5432/postgres
+    # Prefer the "Session pooler" / "Transaction pooler" host+port Supabase
+    # gives you if you're on the free plan, it's friendlier for a small app.
+    url: ${DATABASE_URL}
+    username: ${DATABASE_USERNAME}
+    password: ${DATABASE_PASSWORD}
+    hikari:
+      maximum-pool-size: 5
+      connection-timeout: 20000
+  jpa:
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: false
+    show-sql: false
+  jackson:
+    default-property-inclusion: non_null
+
+ai:
+  gemini:
+    api-key: ${GEMINI_API_KEY:}
+    model: ${GEMINI_MODEL:gemini-2.0-flash}
+
+logging:
+  level:
+    com.tastenotebook: INFO

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: taste-notebook-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_USERNAME
+        sync: false
+      - key: DATABASE_PASSWORD
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
