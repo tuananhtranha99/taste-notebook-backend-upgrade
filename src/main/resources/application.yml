@@ -26,7 +26,11 @@ spring:
 
 ai:
   gemini:
-    api-key: ${GEMINI_API_KEY:}
+    api-key: ${GEMINI_API_KEY}
+  groq:
+    api-key: ${GROQ_API_KEY}
+  openrouter:
+    api-key: ${OPENROUTER_API_KEY}
 
 logging:
   level:

@@ -11,257 +11,472 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
-import java.util.Set;
 
 @Component
 public class AiClient {
 
-    private static final String GEMINI_API_BASE =
+    // ============================================================
+    // Gemini
+    // ============================================================
+
+    private static final String GEMINI_BASE_URL =
             "https://generativelanguage.googleapis.com/v1beta";
 
-    /**
-     * Google-maintained alias.
-     *
-     * This points to the latest Flash model instead of hard-coding
-     * a version such as gemini-2.0-flash or gemini-3.6-flash.
-     */
-    private static final String LATEST_FLASH_MODEL =
+    private static final String GEMINI_PRIMARY =
             "gemini-flash-latest";
 
     /**
-     * Known Gemini Flash models that currently have a Free Tier.
+     * Gemini fallbacks.
      *
-     * This list is only used as a fallback when the latest alias
-     * cannot be used.
-     *
-     * It is intentionally NOT used as the primary selection mechanism.
+     * Flash-Lite is preferred because this app mainly needs:
+     * - classification
+     * - taste matching
+     * - simple reasoning
+     * - JSON generation
      */
-    private static final List<String> FREE_FLASH_FALLBACKS = List.of(
-            "gemini-3.6-flash",
-            "gemini-3.5-flash",
+    private static final List<String> GEMINI_FALLBACK_MODELS = List.of(
             "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite"
     );
 
-    private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .build();
 
-    private final ObjectMapper mapper = new ObjectMapper();
+    // ============================================================
+    // Groq
+    // ============================================================
 
-    @Value("${ai.gemini.api-key:}")
-    private String apiKey;
+    private static final String GROQ_BASE_URL =
+            "https://api.groq.com/openai/v1";
 
     /**
-     * Optional explicit model override.
+     * Fast model suitable for our relatively simple tasks.
      *
-     * If empty:
-     *   -> use gemini-flash-latest
+     * Groq currently lists GPT OSS 20B as an available model
+     * and provides a Free plan with rate limits.
+     */
+    private static final String GROQ_MODEL =
+            "openai/gpt-oss-20b";
+
+
+    // ============================================================
+    // OpenRouter
+    // ============================================================
+
+    private static final String OPENROUTER_BASE_URL =
+            "https://openrouter.ai/api/v1";
+
+    /**
+     * OpenRouter's free router.
      *
-     * Example:
+     * It automatically selects from currently available
+     * free models.
+     */
+    private static final String OPENROUTER_FREE_MODEL =
+            "openrouter/free";
+
+
+    // ============================================================
+    // HTTP
+    // ============================================================
+
+    private final HttpClient httpClient =
+            HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(5))
+                    .build();
+
+    private final ObjectMapper mapper =
+            new ObjectMapper();
+
+
+    // ============================================================
+    // API Keys
+    // ============================================================
+
+    @Value("${ai.gemini.api-key:}")
+    private String geminiApiKey;
+
+    @Value("${ai.groq.api-key:}")
+    private String groqApiKey;
+
+    @Value("${ai.openrouter.api-key:}")
+    private String openRouterApiKey;
+
+
+    // ============================================================
+    // Optional configuration
+    // ============================================================
+
+    /**
+     * If you set:
      *
      * ai.gemini.model=gemini-3.6-flash
      *
-     * If you set this property, the application intentionally uses
-     * the configured model instead of automatic model selection.
+     * that model becomes Gemini's primary model.
+     *
+     * If empty, gemini-flash-latest is used.
      */
-    private String configuredModel;
+    @Value("${ai.gemini.model:}")
+    private String configuredGeminiModel;
+
+
+    // ============================================================
+    // Temporary cooldown
+    // ============================================================
 
     /**
-     * Cached model actually being used.
+     * When a provider returns 429/503, don't immediately hit
+     * the same provider again for the next few seconds.
      *
-     * volatile is enough here because:
-     * - model discovery is rare
-     * - the value is immutable once resolved
-     * - synchronized block protects initialization
+     * IMPORTANT:
+     *
+     * This is NOT a retry delay.
+     *
+     * The current request immediately falls through to the next
+     * provider.
      */
-    private volatile String resolvedModel;
+    private volatile long geminiCooldownUntil = 0;
+
+    private volatile long groqCooldownUntil = 0;
+
+    private volatile long openRouterCooldownUntil = 0;
+
+    private static final long COOLDOWN_MS = 30_000L;
+
+
+    // ============================================================
+    // Public API
+    // ============================================================
 
     /**
-     * Sends a prompt to Gemini and returns the raw text response.
+     * Sends a prompt to an AI provider.
      *
-     * The prompt should instruct the model to reply with JSON only.
-     * Callers are responsible for parsing that JSON themselves.
+     * Failover order:
+     *
+     * 1. Gemini primary
+     * 2. Gemini Flash-Lite
+     * 3. Gemini Flash-Lite older version
+     * 4. Groq
+     * 5. OpenRouter free router
+     *
+     * The first successful provider wins.
      */
     public String generate(String prompt) {
 
-        validateApiKey();
-
         if (prompt == null || prompt.isBlank()) {
-            throw new IllegalArgumentException("Gemini prompt must not be blank.");
+            throw new IllegalArgumentException(
+                    "AI prompt must not be blank."
+            );
         }
 
-        try {
-            String model = getOrResolveModel();
+        List<ProviderAttempt> providers =
+                buildProviderOrder();
+
+        List<String> failures =
+                new ArrayList<>();
+
+        for (ProviderAttempt provider : providers) {
+
+            if (provider.isInCooldown()) {
+
+                System.out.println(
+                        "[AI] Skipping "
+                                + provider.name()
+                                + " because it is in cooldown."
+                );
+
+                continue;
+            }
 
             try {
-                return callGenerateContent(model, prompt);
 
-            } catch (GeminiModelNotFoundException e) {
+                System.out.println(
+                        "[AI] Trying "
+                                + provider.name()
+                );
+
+                String result =
+                        provider.call(prompt);
+
+                System.out.println(
+                        "[AI] SUCCESS: "
+                                + provider.name()
+                );
+
+                return result;
+
+            } catch (TemporaryAiException e) {
+
+                failures.add(
+                        provider.name()
+                                + " -> "
+                                + e.getMessage()
+                );
+
+                System.out.println(
+                        "[AI] Temporary failure from "
+                                + provider.name()
+                                + ": "
+                                + e.getMessage()
+                );
+
+                provider.cooldown();
 
                 /*
-                 * The model may have been retired/deprecated between
-                 * model discovery and the actual request.
+                 * IMPORTANT:
                  *
-                 * Clear the cache and discover again.
+                 * No waiting.
+                 *
+                 * Immediately try next provider.
                  */
-                invalidateResolvedModel();
+                continue;
 
-                String newModel = resolveModel();
+            } catch (ModelNotFoundException e) {
 
-                synchronized (this) {
-                    resolvedModel = newModel;
-                }
+                failures.add(
+                        provider.name()
+                                + " -> model not found"
+                );
 
-                return callGenerateContent(newModel, prompt);
+                System.out.println(
+                        "[AI] Model unavailable: "
+                                + provider.name()
+                                + " -> "
+                                + e.getMessage()
+                );
+
+                continue;
+
+            } catch (Exception e) {
+
+                /*
+                 * For this temporary testing implementation,
+                 * we fail over on provider errors as well.
+                 *
+                 * Later, when productionizing this class,
+                 * we can distinguish:
+                 *
+                 * 400 -> don't fallback
+                 * 401/403 -> don't fallback
+                 * 429/500/503/timeout -> fallback
+                 */
+                failures.add(
+                        provider.name()
+                                + " -> "
+                                + e.getMessage()
+                );
+
+                System.out.println(
+                        "[AI] Failure from "
+                                + provider.name()
+                                + ": "
+                                + e.getMessage()
+                );
+
+                continue;
             }
-
-        } catch (Exception e) {
-            throw new RuntimeException(
-                    "Failed to call Gemini API: " + e.getMessage(),
-                    e
-            );
         }
+
+        throw new RuntimeException(
+                "All AI providers failed. "
+                        + "Failures: "
+                        + failures
+        );
     }
 
-    /**
-     * Returns the cached model or resolves it once.
-     */
-    private String getOrResolveModel() throws Exception {
 
-        String model = resolvedModel;
+    // ============================================================
+    // Provider order
+    // ============================================================
 
-        if (model != null && !model.isBlank()) {
-            return model;
-        }
+    private List<ProviderAttempt> buildProviderOrder() {
 
-        synchronized (this) {
-
-            model = resolvedModel;
-
-            if (model != null && !model.isBlank()) {
-                return model;
-            }
-
-            model = resolveModel();
-
-            resolvedModel = model;
-
-            System.out.println(
-                    "[Gemini] Selected model: " + resolvedModel
-            );
-
-            return model;
-        }
-    }
-
-    /**
-     * Resolves which Gemini model should be used.
-     *
-     * Priority:
-     *
-     * 1. Explicitly configured model
-     * 2. Google-maintained latest Flash alias
-     * 3. Discover available Free Tier Flash models
-     */
-    private String resolveModel() throws Exception {
+        List<ProviderAttempt> providers =
+                new ArrayList<>();
 
         /*
-         * Explicit configuration always wins.
-         *
-         * This is useful if you intentionally want to pin
-         * the application to a specific model.
+         * ========================================================
+         * GEMINI
+         * ========================================================
          */
-        if (configuredModel != null && !configuredModel.isBlank()) {
 
-            String model = normalizeModelName(configuredModel);
+        String primaryGemini =
+                getPrimaryGeminiModel();
 
-            System.out.println(
-                    "[Gemini] Using explicitly configured model: " + model
-            );
-
-            return model;
-        }
-
-        /*
-         * Normally we DO NOT need to call models.list().
-         *
-         * Google provides this alias specifically so applications
-         * don't have to hard-code a versioned Flash model.
-         */
-        System.out.println(
-                "[Gemini] Using Google latest Flash alias: "
-                        + LATEST_FLASH_MODEL
+        providers.add(
+                new ProviderAttempt(
+                        "Gemini/" + primaryGemini,
+                        () -> callGemini(
+                                primaryGemini,
+                                null
+                        ),
+                        this::isGeminiInCooldown,
+                        this::cooldownGemini
+                )
         );
 
-        return LATEST_FLASH_MODEL;
+        /*
+         * Gemini fallback models.
+         */
+        for (String model :
+                GEMINI_FALLBACK_MODELS) {
+
+            if (model.equals(primaryGemini)) {
+                continue;
+            }
+
+            providers.add(
+                    new ProviderAttempt(
+                            "Gemini/" + model,
+                            () -> callGemini(
+                                    model,
+                                    null
+                            ),
+                            this::isGeminiInCooldown,
+                            this::cooldownGemini
+                    )
+            );
+        }
+
+
+        /*
+         * ========================================================
+         * GROQ
+         * ========================================================
+         */
+
+        if (hasText(groqApiKey)) {
+
+            providers.add(
+                    new ProviderAttempt(
+                            "Groq/" + GROQ_MODEL,
+                            () -> callGroq(
+                                    GROQ_MODEL,
+                                    null
+                            ),
+                            this::isGroqInCooldown,
+                            this::cooldownGroq
+                    )
+            );
+        }
+
+
+        /*
+         * ========================================================
+         * OPENROUTER
+         * ========================================================
+         */
+
+        if (hasText(openRouterApiKey)) {
+
+            providers.add(
+                    new ProviderAttempt(
+                            "OpenRouter/"
+                                    + OPENROUTER_FREE_MODEL,
+                            () -> callOpenRouter(
+                                    OPENROUTER_FREE_MODEL,
+                                    null
+                            ),
+                            this::isOpenRouterInCooldown,
+                            this::cooldownOpenRouter
+                    )
+            );
+        }
+
+        return providers;
     }
 
-    /**
-     * Calls Gemini generateContent.
-     */
-    private String callGenerateContent(
+
+    // ============================================================
+    // Gemini
+    // ============================================================
+
+    private String callGemini(
             String model,
             String prompt
     ) throws Exception {
 
-        String normalizedModel = normalizeModelName(model);
+        /*
+         * ProviderAttempt cannot directly pass the prompt
+         * because the lambda is created before generate().
+         *
+         * This method is overridden below through ThreadLocal.
+         *
+         * See callProvider() implementation.
+         */
+        return callGeminiInternal(
+                model,
+                CURRENT_PROMPT.get()
+        );
+    }
 
-        String url = GEMINI_API_BASE
-                + "/models/"
-                + normalizedModel
-                + ":generateContent?key="
-                + apiKey;
+    private String callGeminiInternal(
+            String model,
+            String prompt
+    ) throws Exception {
 
-        var payload = mapper.createObjectNode();
+        if (!hasText(geminiApiKey)) {
 
-        var contents = payload.putArray("contents");
+            throw new IllegalStateException(
+                    "Gemini API key is not configured."
+            );
+        }
 
-        var content = contents.addObject();
+        String normalizedModel =
+                normalizeModelName(model);
 
-        var parts = content.putArray("parts");
+        String url =
+                GEMINI_BASE_URL
+                        + "/models/"
+                        + normalizedModel
+                        + ":generateContent?key="
+                        + geminiApiKey;
+
+        var payload =
+                mapper.createObjectNode();
+
+        var contents =
+                payload.putArray("contents");
+
+        var content =
+                contents.addObject();
+
+        var parts =
+                content.putArray("parts");
 
         parts.addObject()
                 .put("text", prompt);
 
         /*
-         * Ask Gemini to return JSON directly.
-         *
-         * This matches your existing behavior.
+         * Ask Gemini for JSON.
          */
         var generationConfig =
-                payload.putObject("generationConfig");
+                payload.putObject(
+                        "generationConfig"
+                );
 
         generationConfig.put(
                 "response_mime_type",
                 "application/json"
         );
 
-        generationConfig.put(
-                "temperature",
-                0.4
-        );
+        String body =
+                mapper.writeValueAsString(
+                        payload
+                );
 
-        String requestBody =
-                mapper.writeValueAsString(payload);
-
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(30))
-                .header(
-                        "Content-Type",
-                        "application/json"
-                )
-                .POST(
-                        HttpRequest.BodyPublishers.ofString(
-                                requestBody
+        HttpRequest request =
+                HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(8))
+                        .header(
+                                "Content-Type",
+                                "application/json"
                         )
-                )
-                .build();
+                        .POST(
+                                HttpRequest.BodyPublishers
+                                        .ofString(body)
+                        )
+                        .build();
 
         HttpResponse<String> response =
                 httpClient.send(
@@ -269,50 +484,330 @@ public class AiClient {
                         HttpResponse.BodyHandlers.ofString()
                 );
 
-        int status = response.statusCode();
+        int status =
+                response.statusCode();
 
-        /*
-         * 404 is handled specially.
-         *
-         * The model may have been retired even though our cached
-         * model was valid previously.
-         */
+        String responseBody =
+                response.body();
+
+        if (status >= 200 && status < 300) {
+
+            return extractGeminiText(
+                    responseBody
+            );
+        }
+
         if (status == 404) {
 
-            throw new GeminiModelNotFoundException(
-                    "Gemini model '" + normalizedModel
+            throw new ModelNotFoundException(
+                    "Gemini model '"
+                            + normalizedModel
                             + "' is no longer available. "
-                            + response.body()
+                            + responseBody
             );
         }
 
-        if (status >= 300) {
+        if (status == 429 || status == 503) {
 
-            throw new RuntimeException(
-                    "Gemini API error ("
+            throw new TemporaryAiException(
+                    "Gemini "
                             + status
-                            + "): "
-                            + response.body()
+                            + ": "
+                            + responseBody
             );
         }
 
-        return extractText(response.body());
+        throw new RuntimeException(
+                "Gemini API error ("
+                        + status
+                        + "): "
+                        + responseBody
+        );
     }
 
-    /**
-     * Extracts:
-     *
-     * candidates[0]
-     *   -> content
-     *      -> parts[0]
-     *         -> text
-     */
-    private String extractText(
+
+    // ============================================================
+    // Groq
+    // ============================================================
+
+    private String callGroq(
+            String model,
+            String ignored
+    ) throws Exception {
+
+        if (!hasText(groqApiKey)) {
+
+            throw new IllegalStateException(
+                    "Groq API key is not configured."
+            );
+        }
+
+        String prompt =
+                CURRENT_PROMPT.get();
+
+        String url =
+                GROQ_BASE_URL
+                        + "/chat/completions";
+
+        var payload =
+                mapper.createObjectNode();
+
+        payload.put(
+                "model",
+                model
+        );
+
+        var messages =
+                payload.putArray(
+                        "messages"
+                );
+
+        var message =
+                messages.addObject();
+
+        message.put(
+                "role",
+                "user"
+        );
+
+        message.put(
+                "content",
+                prompt
+        );
+
+        /*
+         * Groq uses OpenAI-compatible Chat Completions.
+         *
+         * Ask for JSON.
+         */
+        var responseFormat =
+                payload.putObject(
+                        "response_format"
+                );
+
+        responseFormat.put(
+                "type",
+                "json_object"
+        );
+
+        String body =
+                mapper.writeValueAsString(
+                        payload
+                );
+
+        HttpRequest request =
+                HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(8))
+                        .header(
+                                "Content-Type",
+                                "application/json"
+                        )
+                        .header(
+                                "Authorization",
+                                "Bearer "
+                                        + groqApiKey
+                        )
+                        .POST(
+                                HttpRequest.BodyPublishers
+                                        .ofString(body)
+                        )
+                        .build();
+
+        HttpResponse<String> response =
+                httpClient.send(
+                        request,
+                        HttpResponse.BodyHandlers.ofString()
+                );
+
+        int status =
+                response.statusCode();
+
+        String responseBody =
+                response.body();
+
+        if (status >= 200 && status < 300) {
+
+            return extractOpenAiCompatibleText(
+                    responseBody
+            );
+        }
+
+        if (status == 429
+                || status == 500
+                || status == 502
+                || status == 503
+                || status == 504) {
+
+            throw new TemporaryAiException(
+                    "Groq "
+                            + status
+                            + ": "
+                            + responseBody
+            );
+        }
+
+        throw new RuntimeException(
+                "Groq API error ("
+                        + status
+                        + "): "
+                        + responseBody
+        );
+    }
+
+
+    // ============================================================
+    // OpenRouter
+    // ============================================================
+
+    private String callOpenRouter(
+            String model,
+            String ignored
+    ) throws Exception {
+
+        if (!hasText(openRouterApiKey)) {
+
+            throw new IllegalStateException(
+                    "OpenRouter API key is not configured."
+            );
+        }
+
+        String prompt =
+                CURRENT_PROMPT.get();
+
+        String url =
+                OPENROUTER_BASE_URL
+                        + "/chat/completions";
+
+        var payload =
+                mapper.createObjectNode();
+
+        payload.put(
+                "model",
+                model
+        );
+
+        var messages =
+                payload.putArray(
+                        "messages"
+                );
+
+        var message =
+                messages.addObject();
+
+        message.put(
+                "role",
+                "user"
+        );
+
+        message.put(
+                "content",
+                prompt
+        );
+
+        /*
+         * Request JSON output where supported.
+         *
+         * openrouter/free automatically selects an available
+         * free model. OpenRouter's free router supports structured
+         * outputs for models that support the feature.
+         */
+        var responseFormat =
+                payload.putObject(
+                        "response_format"
+                );
+
+        responseFormat.put(
+                "type",
+                "json_object"
+        );
+
+        String body =
+                mapper.writeValueAsString(
+                        payload
+                );
+
+        HttpRequest request =
+                HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .timeout(Duration.ofSeconds(10))
+                        .header(
+                                "Content-Type",
+                                "application/json"
+                        )
+                        .header(
+                                "Authorization",
+                                "Bearer "
+                                        + openRouterApiKey
+                        )
+                        .header(
+                                "HTTP-Referer",
+                                "http://localhost"
+                        )
+                        .header(
+                                "X-Title",
+                                "Food Recommendation App"
+                        )
+                        .POST(
+                                HttpRequest.BodyPublishers
+                                        .ofString(body)
+                        )
+                        .build();
+
+        HttpResponse<String> response =
+                httpClient.send(
+                        request,
+                        HttpResponse.BodyHandlers.ofString()
+                );
+
+        int status =
+                response.statusCode();
+
+        String responseBody =
+                response.body();
+
+        if (status >= 200 && status < 300) {
+
+            return extractOpenAiCompatibleText(
+                    responseBody
+            );
+        }
+
+        if (status == 429
+                || status == 500
+                || status == 502
+                || status == 503
+                || status == 504) {
+
+            throw new TemporaryAiException(
+                    "OpenRouter "
+                            + status
+                            + ": "
+                            + responseBody
+            );
+        }
+
+        throw new RuntimeException(
+                "OpenRouter API error ("
+                        + status
+                        + "): "
+                        + responseBody
+        );
+    }
+
+
+    // ============================================================
+    // Response parsing
+    // ============================================================
+
+    private String extractGeminiText(
             String responseBody
     ) throws Exception {
 
         JsonNode root =
-                mapper.readTree(responseBody);
+                mapper.readTree(
+                        responseBody
+                );
 
         JsonNode candidates =
                 root.path("candidates");
@@ -321,7 +816,7 @@ public class AiClient {
                 || candidates.isEmpty()) {
 
             throw new RuntimeException(
-                    "Gemini returned no candidates. Response: "
+                    "Gemini returned no candidates. "
                             + responseBody
             );
         }
@@ -338,8 +833,7 @@ public class AiClient {
                 || text.asText().isBlank()) {
 
             throw new RuntimeException(
-                    "Gemini returned an empty text response. "
-                            + "Response: "
+                    "Gemini returned empty response. "
                             + responseBody
             );
         }
@@ -347,263 +841,278 @@ public class AiClient {
         return text.asText();
     }
 
-    /**
-     * Invalidate cached model.
-     */
-    private void invalidateResolvedModel() {
 
-        synchronized (this) {
-            resolvedModel = null;
+    /**
+     * Parses OpenAI-compatible responses from:
+     *
+     * Groq
+     * OpenRouter
+     */
+    private String extractOpenAiCompatibleText(
+            String responseBody
+    ) throws Exception {
+
+        JsonNode root =
+                mapper.readTree(
+                        responseBody
+                );
+
+        JsonNode choices =
+                root.path("choices");
+
+        if (!choices.isArray()
+                || choices.isEmpty()) {
+
+            throw new RuntimeException(
+                    "AI provider returned no choices. "
+                            + responseBody
+            );
         }
 
-        System.out.println(
-                "[Gemini] Cached model invalidated."
+        JsonNode message =
+                choices
+                        .path(0)
+                        .path("message");
+
+        JsonNode content =
+                message.path("content");
+
+        if (content.isTextual()
+                && !content.asText().isBlank()) {
+
+            return content.asText();
+        }
+
+        /*
+         * Some reasoning models may put the useful output
+         * into another field depending on provider/model.
+         */
+        JsonNode text =
+                choices
+                        .path(0)
+                        .path("text");
+
+        if (text.isTextual()
+                && !text.asText().isBlank()) {
+
+            return text.asText();
+        }
+
+        throw new RuntimeException(
+                "AI provider returned empty content. "
+                        + responseBody
         );
     }
 
-    /**
-     * Validates Gemini API key.
-     */
-    private void validateApiKey() {
 
-        if (apiKey == null || apiKey.isBlank()) {
+    // ============================================================
+    // Gemini model selection
+    // ============================================================
 
-            throw new IllegalStateException(
-                    "GEMINI_API_KEY is not set. "
-                            + "Get a free key at "
-                            + "https://aistudio.google.com/apikey"
+    private String getPrimaryGeminiModel() {
+
+        if (hasText(configuredGeminiModel)) {
+
+            return normalizeModelName(
+                    configuredGeminiModel
             );
         }
+
+        return GEMINI_PRIMARY;
     }
 
-    /**
-     * Normalizes model names.
-     *
-     * Accepts both:
-     *
-     * gemini-3.6-flash
-     *
-     * and:
-     *
-     * models/gemini-3.6-flash
-     */
+
+    // ============================================================
+    // Cooldown
+    // ============================================================
+
+    private boolean isGeminiInCooldown() {
+
+        return System.currentTimeMillis()
+                < geminiCooldownUntil;
+    }
+
+    private void cooldownGemini() {
+
+        geminiCooldownUntil =
+                System.currentTimeMillis()
+                        + COOLDOWN_MS;
+    }
+
+    private boolean isGroqInCooldown() {
+
+        return System.currentTimeMillis()
+                < groqCooldownUntil;
+    }
+
+    private void cooldownGroq() {
+
+        groqCooldownUntil =
+                System.currentTimeMillis()
+                        + COOLDOWN_MS;
+    }
+
+    private boolean isOpenRouterInCooldown() {
+
+        return System.currentTimeMillis()
+                < openRouterCooldownUntil;
+    }
+
+    private void cooldownOpenRouter() {
+
+        openRouterCooldownUntil =
+                System.currentTimeMillis()
+                        + COOLDOWN_MS;
+    }
+
+
+    // ============================================================
+    // Helpers
+    // ============================================================
+
     private String normalizeModelName(
             String model
     ) {
 
         if (model == null) {
             throw new IllegalArgumentException(
-                    "Gemini model must not be null."
+                    "AI model must not be null."
             );
         }
 
-        String normalized =
+        String result =
                 model.trim();
 
-        if (normalized.startsWith("models/")) {
-            normalized =
-                    normalized.substring("models/".length());
+        if (result.startsWith("models/")) {
+
+            result =
+                    result.substring(
+                            "models/".length()
+                    );
         }
 
-        if (normalized.isBlank()) {
+        if (result.isBlank()) {
+
             throw new IllegalArgumentException(
-                    "Gemini model must not be blank."
+                    "AI model must not be blank."
             );
         }
 
-        return normalized;
+        return result;
     }
 
+    private boolean hasText(
+            String value
+    ) {
+
+        return value != null
+                && !value.isBlank();
+    }
+
+
+    // ============================================================
+    // ThreadLocal prompt
+    // ============================================================
+
     /**
-     * Optional helper if you ever want to inspect which Gemini
-     * models your API key can currently access.
-     *
-     * This is NOT called for every generate() request.
+     * Used only to keep the whole temporary implementation
+     * inside this single class without creating provider classes.
      */
-    public List<GeminiModel> listAvailableFlashModels()
-            throws Exception {
+    private static final ThreadLocal<String> CURRENT_PROMPT =
+            new ThreadLocal<>();
 
-        validateApiKey();
 
-        String url =
-                GEMINI_API_BASE
-                        + "/models?key="
-                        + apiKey;
+    // ============================================================
+    // Provider attempt
+    // ============================================================
 
-        HttpRequest request =
-                HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .timeout(Duration.ofSeconds(10))
-                        .GET()
-                        .build();
+    private class ProviderAttempt {
 
-        HttpResponse<String> response =
-                httpClient.send(
-                        request,
-                        HttpResponse.BodyHandlers.ofString()
-                );
+        private final String name;
 
-        if (response.statusCode() >= 300) {
+        private final ThrowingSupplier supplier;
 
-            throw new RuntimeException(
-                    "Failed to list Gemini models ("
-                            + response.statusCode()
-                            + "): "
-                            + response.body()
-            );
+        private final CooldownChecker cooldownChecker;
+
+        private final Runnable cooldownAction;
+
+        ProviderAttempt(
+                String name,
+                ThrowingSupplier supplier,
+                CooldownChecker cooldownChecker,
+                Runnable cooldownAction
+        ) {
+
+            this.name = name;
+            this.supplier = supplier;
+            this.cooldownChecker = cooldownChecker;
+            this.cooldownAction = cooldownAction;
         }
 
-        JsonNode root =
-                mapper.readTree(response.body());
+        String name() {
+            return name;
+        }
 
-        List<GeminiModel> models =
-                new ArrayList<>();
+        boolean isInCooldown() {
+            return cooldownChecker.isInCooldown();
+        }
 
-        for (JsonNode node :
-                root.path("models")) {
+        void cooldown() {
+            cooldownAction.run();
+        }
 
-            String name =
-                    node.path("name").asText();
-
-            String baseModelId =
-                    node.path("baseModelId").asText();
-
-            String displayName =
-                    node.path("displayName").asText();
-
-            boolean supportsGenerateContent =
-                    supportsGenerateContent(node);
-
-            if (!supportsGenerateContent) {
-                continue;
-            }
-
-            String modelId =
-                    !baseModelId.isBlank()
-                            ? baseModelId
-                            : normalizeModelName(name);
-
-            String lower =
-                    modelId.toLowerCase(
-                            Locale.ROOT
-                    );
+        String call(String prompt)
+                throws Exception {
 
             /*
-             * Only text Flash models.
-             *
-             * Avoid:
-             * - image
-             * - tts
-             * - live
-             * - embedding
-             * - robotics
+             * Set prompt so provider lambdas can access it.
              */
-            if (!lower.contains("flash")) {
-                continue;
-            }
+            CURRENT_PROMPT.set(prompt);
 
-            if (lower.contains("image")
-                    || lower.contains("tts")
-                    || lower.contains("live")) {
-                continue;
-            }
-
-            models.add(
-                    new GeminiModel(
-                            modelId,
-                            displayName
-                    )
-            );
-        }
-
-        return models;
-    }
-
-    /**
-     * Checks whether the model supports generateContent.
-     */
-    private boolean supportsGenerateContent(
-            JsonNode model
-    ) {
-
-        JsonNode methods =
-                model.path(
-                        "supportedGenerationMethods"
-                );
-
-        if (!methods.isArray()) {
-            return false;
-        }
-
-        for (JsonNode method : methods) {
-
-            if ("generateContent"
-                    .equals(method.asText())) {
-
-                return true;
+            try {
+                return supplier.get();
+            } finally {
+                CURRENT_PROMPT.remove();
             }
         }
-
-        return false;
     }
 
-    /**
-     * Returns the best currently available Free Tier
-     * Flash fallback.
-     *
-     * This method is intentionally not used during normal
-     * requests because gemini-flash-latest is the preferred
-     * solution.
-     */
-    public String resolveFreeFallbackModel()
-            throws Exception {
 
-        List<GeminiModel> available =
-                listAvailableFlashModels();
+    // ============================================================
+    // Functional interfaces
+    // ============================================================
 
-        Set<String> availableIds =
-                new HashSet<>();
+    @FunctionalInterface
+    private interface ThrowingSupplier {
 
-        for (GeminiModel model : available) {
-            availableIds.add(
-                    normalizeModelName(model.name())
-            );
-        }
-
-        /*
-         * Prefer known Free Tier models in a deterministic order.
-         */
-        for (String preferred :
-                FREE_FLASH_FALLBACKS) {
-
-            if (availableIds.contains(preferred)) {
-                return preferred;
-            }
-        }
-
-        throw new IllegalStateException(
-                "No known Free Tier Gemini Flash model "
-                        + "supporting generateContent is available."
-        );
+        String get() throws Exception;
     }
 
-    /**
-     * Small immutable representation of a Gemini model.
-     */
-    public record GeminiModel(
-            String name,
-            String displayName
-    ) {
+    @FunctionalInterface
+    private interface CooldownChecker {
+
+        boolean isInCooldown();
     }
 
-    /**
-     * Special exception used only when Gemini reports
-     * that the selected model no longer exists.
-     */
-    private static class GeminiModelNotFoundException
+
+    // ============================================================
+    // Exceptions
+    // ============================================================
+
+    private static class TemporaryAiException
             extends RuntimeException {
 
-        public GeminiModelNotFoundException(
+        TemporaryAiException(
+                String message
+        ) {
+            super(message);
+        }
+    }
+
+    private static class ModelNotFoundException
+            extends RuntimeException {
+
+        ModelNotFoundException(
                 String message
         ) {
             super(message);
